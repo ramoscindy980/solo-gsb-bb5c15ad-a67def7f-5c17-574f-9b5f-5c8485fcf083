@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .correlation import (
     DEFAULT_GAP_SECONDS,
+    build_event_lineage,
     correlate_events,
     event_signature,
     normalize_gap,
@@ -783,6 +784,207 @@ def recompute_events():
     try:
         gap = _get_gap(conn)
         return _reconcile_events(conn, gap)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 事件演进：快照保存与两快照血缘对比
+#
+# 快照是生成时刻关联事件的**不可变副本**：成员 id/序号、确认状态、聚合间隔
+# 与生成时间一并写入 event_snapshot_items。撤销告警（alerts 行级联删除）、
+# 修改聚合间隔或删除 events 行都不会触碰快照表，因此历史快照永不被改写。
+# 本节只读写 event_snapshots / event_snapshot_items，不改变 live/replay 语义。
+# ---------------------------------------------------------------------------
+
+def _snapshot_item_dict(row) -> dict:
+    return {
+        "item_id": row["item_index"],
+        "db_id": row["id"],
+        "device_id": row["device_id"],
+        "alert_type": row["alert_type"],
+        "first_ts": row["first_ts"],
+        "last_ts": row["last_ts"],
+        "alert_count": row["alert_count"],
+        "max_level": row["max_level"],
+        "member_ids": json.loads(row["member_ids"]),
+        "member_seqs": json.loads(row["member_seqs"]),
+        "acknowledged": bool(row["acknowledged"]),
+        "acked_at": row["acked_at"],
+    }
+
+
+def _snapshot_meta_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "note": row["note"],
+        "gap_seconds": row["gap_seconds"],
+        "event_count": row["event_count"],
+        "alert_count": row["alert_count"],
+        "acked_count": row["acked_count"],
+    }
+
+
+def _load_snapshot_items(conn, snapshot_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM event_snapshot_items WHERE snapshot_id=? ORDER BY item_index",
+        (snapshot_id,),
+    ).fetchall()
+    return [_snapshot_item_dict(r) for r in rows]
+
+
+@app.get("/api/event-snapshots")
+def list_event_snapshots():
+    """全部事件演进快照（不含成员明细），按生成时间倒序。"""
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM event_snapshots ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        return [_snapshot_meta_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/event-snapshots")
+def create_event_snapshot(payload: dict = Body(default={})):
+    """把当前关联事件保存为不可变快照。
+
+    先按当前告警集合与已保存间隔确定性重算（语义与「事件关联」页完全一致，
+    仅操作 events 表），再把每个事件的成员 id/序号与确认状态复制进快照表。
+    之后撤销告警、修改间隔都不会影响本快照。
+    """
+    note = str((payload or {}).get("note", "")).strip()[:200]
+    conn = db.get_conn()
+    try:
+        gap = _get_gap(conn)
+        _reconcile_events(conn, gap)  # 保证快照反映"当前"关联结果
+
+        alerts = _load_all_alerts(conn)
+        grouped = correlate_events(alerts, gap)
+        # correlate_events 已按 (first_ts, device, type, 首成员 id) 稳定排序
+        events = conn.execute("SELECT * FROM events").fetchall()
+        ack_by_sig = {r["signature"]: (bool(r["acknowledged"]), r["acked_at"])
+                      for r in events}
+
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                "INSERT INTO event_snapshots(note, gap_seconds) VALUES (?, ?)",
+                (note, gap),
+            )
+            snap_id = cur.lastrowid
+            unique_members: set[int] = set()
+            acked = 0
+            for idx, e in enumerate(grouped):
+                sig = event_signature(
+                    gap, e["device_id"], e["alert_type"], e["member_ids"]
+                )
+                is_ack, acked_at = ack_by_sig.get(sig, (False, None))
+                if is_ack:
+                    acked += 1
+                unique_members.update(e["member_ids"])
+                conn.execute(
+                    """INSERT INTO event_snapshot_items(snapshot_id, item_index,
+                       device_id, alert_type, first_ts, last_ts, alert_count,
+                       max_level, member_ids, member_seqs, acknowledged, acked_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (snap_id, idx, e["device_id"], e["alert_type"],
+                     e["first_ts"].isoformat(timespec="seconds"),
+                     e["last_ts"].isoformat(timespec="seconds"),
+                     e["alert_count"], e["max_level"],
+                     json.dumps(e["member_ids"]), json.dumps(e["member_seqs"]),
+                     1 if is_ack else 0, acked_at),
+                )
+            conn.execute(
+                "UPDATE event_snapshots SET event_count=?, alert_count=?, acked_count=? "
+                "WHERE id=?",
+                (len(grouped), len(unique_members), acked, snap_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (snap_id,)
+        ).fetchone()
+        return _snapshot_meta_dict(row)
+    finally:
+        conn.close()
+
+
+@app.get("/api/event-snapshots/compare")
+def compare_event_snapshots(old_id: int, new_id: Optional[int] = None):
+    """对比任意两个事件快照，按成员交集建立确定性血缘。
+
+    - old_id: 旧快照（对比基准）；new_id: 新快照，缺省取最新一个快照；
+    - 每条边给出 新增 / 消失 / 延续 / 拆分 / 合并 标记（拆分合并可同时出现）、
+      两侧成员 id/序号与交集数量；成员完全相同但确认状态变化单独标记；
+    - 边按新事件首时间、旧事件 item_id 稳定排序。
+
+    本路由必须注册在 ``/api/event-snapshots/{snapshot_id}`` 之前，否则
+    ``compare`` 会被当作路径参数。
+    """
+    conn = db.get_conn()
+    try:
+        if new_id is None:
+            latest = conn.execute(
+                "SELECT id FROM event_snapshots ORDER BY created_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            if not latest:
+                raise HTTPException(404, "尚无事件快照")
+            new_id = latest["id"]
+        old_row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (old_id,)
+        ).fetchone()
+        new_row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (new_id,)
+        ).fetchone()
+        if not old_row:
+            raise HTTPException(404, f"旧快照 {old_id} 不存在")
+        if not new_row:
+            raise HTTPException(404, f"新快照 {new_id} 不存在")
+
+        old_items = _load_snapshot_items(conn, old_id)
+        new_items = _load_snapshot_items(conn, new_id)
+        result = build_event_lineage(old_items, new_items)
+        return {
+            "old_snapshot": _snapshot_meta_dict(old_row),
+            "new_snapshot": _snapshot_meta_dict(new_row),
+            "edges": result["edges"],
+            "stats": result["stats"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/event-snapshots/{snapshot_id}")
+def get_event_snapshot(snapshot_id: int):
+    """单个快照的元信息与全部事件条目（含成员 id/序号、确认状态）。"""
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "事件快照不存在")
+        return {**_snapshot_meta_dict(row), "items": _load_snapshot_items(conn, snapshot_id)}
+    finally:
+        conn.close()
+
+
+@app.delete("/api/event-snapshots/{snapshot_id}")
+def delete_event_snapshot(snapshot_id: int):
+    """删除快照（及其条目）；只删演进记录，不影响当前关联事件与任何决定。"""
+    conn = db.get_conn()
+    try:
+        cur = conn.execute("DELETE FROM event_snapshots WHERE id=?", (snapshot_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "事件快照不存在")
+        return {"ok": True}
     finally:
         conn.close()
 

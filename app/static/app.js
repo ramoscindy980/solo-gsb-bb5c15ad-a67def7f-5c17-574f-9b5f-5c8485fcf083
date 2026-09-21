@@ -20,6 +20,8 @@ let state = {
   settings: {},
   compare: { a: null, b: null, result: null },
   events: { events: [], devices: [], gap_seconds: 900 },
+  snapshots: [],
+  evolve: { oldId: null, newId: null, result: null },
 };
 
 function eventFilters() {
@@ -353,6 +355,208 @@ async function toggleEventAck(id, ack) {
 }
 
 // ---------------------------------------------------------------------------
+// Tab 2b: 事件演进（不可变快照 + 血缘对比）
+// ---------------------------------------------------------------------------
+
+async function loadSnapshots(preserveSelection = true) {
+  const prevOld = state.evolve.oldId, prevNew = state.evolve.newId;
+  state.snapshots = await api("/api/event-snapshots");
+  renderSnapshots();
+  renderSnapshotSelects();
+  const has = (id) => state.snapshots.some((s) => s.id === id);
+  if (preserveSelection && has(prevOld)) state.evolve.oldId = prevOld;
+  else state.evolve.oldId = state.snapshots.length ? state.snapshots[state.snapshots.length - 1].id : null;
+  if (preserveSelection && has(prevNew)) state.evolve.newId = prevNew;
+  else state.evolve.newId = state.snapshots.length ? state.snapshots[0].id : null;
+  syncSnapshotSelects();
+}
+
+function snapshotLabel(s) {
+  return `#${s.id} ${s.created_at} · ${s.gap_seconds}s · ${s.event_count} 事件/${s.alert_count} 告警 · ${s.acked_count} 已确认${s.note ? ` — ${s.note}` : ""}`;
+}
+
+function renderSnapshots() {
+  $("#snap-count").textContent = `${state.snapshots.length} 个快照`;
+  const box = $("#snapshot-list");
+  if (!state.snapshots.length) {
+    box.innerHTML = '<p class="empty">还没有快照。先在「事件关联」页注入告警，然后点上方按钮保存当前事件。</p>';
+    return;
+  }
+  box.innerHTML = state.snapshots.map((s) => `
+    <div class="snap-item">
+      <div class="snap-meta">
+        <b>#${s.id}</b>
+        <span class="badge">间隔 ${s.gap_seconds}s</span>
+        <span class="badge">${s.event_count} 事件</span>
+        <span class="badge">${s.alert_count} 成员告警</span>
+        <span class="badge pass">${s.acked_count} 已确认</span>
+        <span class="hint" style="margin:0">生成于 ${esc(s.created_at)}</span>
+      </div>
+      <div class="snap-note">${esc(s.note || "（无说明）")}</div>
+      <div class="snap-actions">
+        <button class="btn small" data-snap-old="${s.id}">作为旧快照</button>
+        <button class="btn small" data-snap-new="${s.id}">作为新快照</button>
+        <button class="btn small danger" data-del-snap="${s.id}">删除</button>
+      </div>
+    </div>`).join("");
+}
+
+function renderSnapshotSelects() {
+  const opts = state.snapshots
+    .map((s) => `<option value="${s.id}">${esc(snapshotLabel(s))}</option>`).join("");
+  $("#evo-old").innerHTML = opts;
+  $("#evo-new").innerHTML = opts;
+}
+
+function syncSnapshotSelects() {
+  if (state.evolve.oldId != null) $("#evo-old").value = state.evolve.oldId;
+  if (state.evolve.newId != null) $("#evo-new").value = state.evolve.newId;
+}
+
+async function createSnapshot() {
+  const note = $("#snap-note").value.trim();
+  try {
+    const s = await api("/api/event-snapshots", {
+      method: "POST", body: JSON.stringify({ note }),
+    });
+    $("#snap-note").value = "";
+    // 新快照作为"新快照"，原来的最新（现在第二新）作为"旧快照"便于立即对比
+    const before = state.snapshots.length ? state.snapshots[0].id : null;
+    await loadSnapshots();
+    state.evolve.newId = s.id;
+    state.evolve.oldId = before || s.id;
+    syncSnapshotSelects();
+    await loadEvolution();
+    toast(`快照 #${s.id} 已保存：${s.event_count} 个事件 / ${s.alert_count} 条成员告警`);
+  } catch (e) { fail(e); }
+}
+
+async function loadEvolution() {
+  const oldId = Number($("#evo-old").value);
+  const newId = Number($("#evo-new").value);
+  if (!oldId || !newId) {
+    state.evolve.result = null;
+    $("#evo-summary").innerHTML = "";
+    $("#evo-result").innerHTML = '<p class="empty">至少保存两个快照后可对比；也允许选择同一个快照（结果应全部一致）。</p>';
+    return;
+  }
+  state.evolve.oldId = oldId;
+  state.evolve.newId = newId;
+  try {
+    state.evolve.result = await api(
+      `/api/event-snapshots/compare?old_id=${oldId}&new_id=${newId}`);
+    renderEvolution();
+  } catch (e) { fail(e); }
+}
+
+const RELATION_META = {
+  added: { label: "新增", cls: "lg-added" },
+  removed: { label: "消失", cls: "lg-removed" },
+  continued: { label: "延续", cls: "lg-continued" },
+  split: { label: "拆分", cls: "lg-split" },
+  merge: { label: "合并", cls: "lg-merge" },
+  split_merge: { label: "拆分+合并", cls: "lg-split" },
+};
+
+function eventHead(item, side) {
+  if (!item) return `<div class="ev-head-empty">（无${side === "old" ? "旧" : "新"}事件）</div>`;
+  const ack = item.acknowledged
+    ? '<span class="badge pass">✓ 已确认</span>'
+    : '<span class="badge suppress">● 未确认</span>';
+  return `<div class="ev-head-title">
+      <b>#${item.item_id}</b>
+      <b>${esc(item.device_id || "(空设备)")}</b>
+      <span class="badge">${esc(item.alert_type || "(无类型)")}</span>
+      ${levelBadge(item.max_level)}
+      ${ack}
+      ${item.acked_at ? `<span class="hint" style="margin:0">确认于 ${esc(item.acked_at)}</span>` : ""}
+    </div>
+    <div class="ev-head-meta">
+      ${esc(item.first_ts)} → ${esc(item.last_ts)} · ${item.alert_count} 条成员
+    </div>`;
+}
+
+function seqChips(ids, seqs, cls) {
+  if (!ids.length) return '<span class="hint" style="margin:0">—</span>';
+  return ids.map((id, i) =>
+    `<span class="seq-chip ${cls}" title="告警 id=${id}">#${esc(seqs[i] ?? "?")}</span>`).join(" ");
+}
+
+function renderEvolution() {
+  const res = state.evolve.result;
+  const box = $("#evo-result");
+  if (!res) return;
+  const st = res.stats;
+  const onlyChanges = $("#evo-only-changes").checked;
+  $("#evo-summary").innerHTML = `
+    旧快照 <b>#${res.old_snapshot.id}</b>（${esc(res.old_snapshot.created_at)}，间隔 ${res.old_snapshot.gap_seconds}s）
+    → 新快照 <b>#${res.new_snapshot.id}</b>（${esc(res.new_snapshot.created_at)}，间隔 ${res.new_snapshot.gap_seconds}s）<br>
+    共 ${st.total} 条血缘：
+    <span class="lg lg-added">新增 ${st.added}</span> ·
+    <span class="lg lg-removed">消失 ${st.removed}</span> ·
+    <span class="lg lg-continued">延续 ${st.continued}</span> ·
+    <span class="lg lg-split">拆分支 ${st.split}</span> ·
+    <span class="lg lg-merge">合并支 ${st.merge}</span> ·
+    <span class="lg lg-ack">确认状态变化 ${st.ack_changed}</span> ·
+    <b style="color:var(--amber)">${st.changed} 条有变化</b>`;
+
+  let edges = res.edges;
+  if (onlyChanges) edges = edges.filter((e) => e.is_change);
+  if (!edges.length) {
+    box.innerHTML = '<p class="empty">没有符合条件的血缘（全部一致，或无快照数据）。</p>';
+    return;
+  }
+
+  box.innerHTML = edges.map((e) => {
+    const meta = RELATION_META[e.relation] || RELATION_META.continued;
+    const tags = [];
+    if (e.relation === "split_merge") {
+      tags.push('<span class="rel-badge rel-split">拆分</span>');
+      tags.push('<span class="rel-badge rel-merge">合并</span>');
+    } else {
+      tags.push(`<span class="rel-badge ${e.relation === "added" ? "rel-added"
+        : e.relation === "removed" ? "rel-removed"
+        : e.relation === "split" ? "rel-split"
+        : e.relation === "merge" ? "rel-merge" : "rel-continued"}">${meta.label}</span>`);
+    }
+    if (e.ack_changed) tags.push('<span class="rel-badge rel-ack">⚠ 成员相同，确认状态变化</span>');
+
+    const ov = e.overlap_count
+      ? `<div class="mem-line"><span class="mem-label">共同成员 ×${e.overlap_count}</span>
+           <span class="mem-chips">${seqChips(e.overlap_member_ids, e.overlap_member_seqs, "chip-common")}</span></div>`
+      : "";
+    const oldOnly = (e.old_only_member_ids && e.old_only_member_ids.length)
+      ? `<div class="mem-line"><span class="mem-label">仅旧侧（消失成员）</span>
+           <span class="mem-chips">${seqChips(e.old_only_member_ids, e.old_only_member_seqs, "chip-old")}</span></div>`
+      : "";
+    const newOnly = (e.new_only_member_ids && e.new_only_member_ids.length)
+      ? `<div class="mem-line"><span class="mem-label">仅新侧（新增成员）</span>
+           <span class="mem-chips">${seqChips(e.new_only_member_ids, e.new_only_member_seqs, "chip-new")}</span></div>`
+      : "";
+
+    return `<div class="evo-row rel-${esc(e.relation)}${e.ack_changed ? " is-ack-change" : ""}">
+      <div class="evo-tags">${tags.join(" ")}</div>
+      <div class="evo-sides">
+        <div class="evo-side side-old">
+          <div class="side-label">旧侧事件</div>
+          ${eventHead(e.old, "old")}
+        </div>
+        <div class="evo-arrow" title="成员交集 ${e.overlap_count} 个">
+          <span class="arrow-count">∩ ${e.overlap_count}</span>
+        </div>
+        <div class="evo-side side-new">
+          <div class="side-label">新侧事件</div>
+          ${eventHead(e.new, "new")}
+        </div>
+      </div>
+      <div class="evo-members">
+        ${ov}${oldOnly}${newOnly}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// ---------------------------------------------------------------------------
 // Tab 3: 规则
 // ---------------------------------------------------------------------------
 
@@ -654,6 +858,23 @@ document.addEventListener("click", async (e) => {
       await loadRules(); renderRules();
     } catch (err) { fail(err); }
   }
+  if (ds.snapOld || ds.snapNew) {
+    const id = Number(ds.snapOld || ds.snapNew);
+    if (ds.snapOld) state.evolve.oldId = id;
+    else state.evolve.newId = id;
+    syncSnapshotSelects();
+    await loadEvolution();
+  }
+  if (ds.delSnap) {
+    if (!confirm("确认删除该事件快照？\n仅删除这份不可变记录，不影响当前关联事件与任何决定。")) return;
+    try {
+      await api(`/api/event-snapshots/${ds.delSnap}`, { method: "DELETE" });
+      state.evolve.result = null;
+      await loadSnapshots();
+      await loadEvolution();
+      toast("快照已删除");
+    } catch (err) { fail(err); }
+  }
 });
 
 function bind() {
@@ -664,6 +885,11 @@ function bind() {
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "receiver") loadReceiverLogs();
     if (btn.dataset.tab === "events") loadEvents().catch(fail);
+    if (btn.dataset.tab === "evolve") {
+      loadSnapshots()
+        .then(() => loadEvolution())
+        .catch(fail);
+    }
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -693,6 +919,13 @@ function bind() {
   $("#btn-replay").addEventListener("click", doReplay);
   $("#cmp-a").addEventListener("change", loadCompare);
   $("#cmp-b").addEventListener("change", loadCompare);
+  $("#btn-save-snapshot").addEventListener("click", createSnapshot);
+  $("#btn-refresh-snapshots").addEventListener("click", async () => {
+    try { await loadSnapshots(); await loadEvolution(); } catch (e) { fail(e); }
+  });
+  $("#evo-old").addEventListener("change", () => loadEvolution().catch(fail));
+  $("#evo-new").addEventListener("change", () => loadEvolution().catch(fail));
+  $("#evo-only-changes").addEventListener("change", renderEvolution);
   $("#btn-save-settings").addEventListener("click", saveSettings);
   $("#btn-test-mock").addEventListener("click", testMock);
   $("#btn-clear-logs").addEventListener("click", async () => {

@@ -104,6 +104,37 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_times ON events(first_ts, last_ts);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, alert_type);
+
+-- 事件演进快照：保存时刻的关联事件集合为不可变记录。
+-- 不使用指向 alerts/events 的外键：撤销告警、调整间隔或删除事件都不得改写历史快照。
+CREATE TABLE IF NOT EXISTS event_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    note TEXT NOT NULL DEFAULT '',
+    gap_seconds INTEGER NOT NULL,               -- 生成快照时的聚合间隔
+    event_count INTEGER NOT NULL DEFAULT 0,    -- 快照内事件（条目）数量
+    alert_count INTEGER NOT NULL DEFAULT 0,    -- 快照内去重成员告警总数
+    acked_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_event_snapshots_created ON event_snapshots(created_at, id);
+
+CREATE TABLE IF NOT EXISTS event_snapshot_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL REFERENCES event_snapshots(id) ON DELETE CASCADE,
+    item_index INTEGER NOT NULL,               -- 快照内稳定序号（按首时间排序）
+    device_id TEXT NOT NULL DEFAULT '',
+    alert_type TEXT NOT NULL DEFAULT '',
+    first_ts TEXT NOT NULL,
+    last_ts TEXT NOT NULL,
+    alert_count INTEGER NOT NULL,
+    max_level TEXT NOT NULL DEFAULT 'info',
+    member_ids TEXT NOT NULL,                  -- JSON: 按时间线排序的 alerts.id（自有副本）
+    member_seqs TEXT NOT NULL,                 -- JSON: 对应注入序号 #seq（自有副本）
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    acked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_event_snapshot_items_snap
+    ON event_snapshot_items(snapshot_id, item_index);
 """
 
 _RULE_COLS = [
@@ -218,7 +249,8 @@ def reset_all(conn) -> None:
     try:
         conn.executescript(
             "DELETE FROM decisions; DELETE FROM receiver_logs; DELETE FROM staged; "
-            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events;"
+            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events; "
+            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
         )
         inserted_ids = []
         for rule in seed_rules():
@@ -269,7 +301,8 @@ def init_db(force_seed: bool = False) -> None:
                     conn.executescript(
                         "DELETE FROM decisions; DELETE FROM receiver_logs; "
                         "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; "
-                        "DELETE FROM runs; DELETE FROM events;"
+                        "DELETE FROM runs; DELETE FROM events; "
+                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
                     )
                 for rule in seed_rules():
                     conn.execute(

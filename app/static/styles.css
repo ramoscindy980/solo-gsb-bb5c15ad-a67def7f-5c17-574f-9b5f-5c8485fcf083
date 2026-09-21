@@ -228,3 +228,77 @@ tr:hover td { background: rgba(56, 189, 248, 0.04); }
 .tl-ts { color: var(--muted); font-family: "SF Mono", Consolas, monospace; font-size: 11.5px; }
 .tl-msg { color: var(--text); flex: 1; min-width: 180px; }
 .decision.small { font-size: 11px; padding: 1px 7px; }
+
+/* ---------------- 事件演进（快照 + 血缘对比） ---------------- */
+.snap-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.snap-item {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.snap-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.snap-meta b { color: var(--accent); }
+.snap-note { font-size: 12.5px; color: var(--text); }
+.snap-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.evo-legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 8px 0 12px; font-size: 12.5px; }
+.lg { font-weight: 600; white-space: nowrap; }
+.lg-added { color: var(--green); }
+.lg-removed { color: var(--red); }
+.lg-continued { color: var(--muted); }
+.lg-split { color: var(--amber); }
+.lg-merge { color: #c084fc; }
+.lg-ack { color: #60a5fa; }
+
+.evo-result { display: flex; flex-direction: column; gap: 10px; }
+.evo-row {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2); padding: 10px 12px;
+  border-left: 3px solid var(--muted);
+}
+.evo-row.rel-added { border-left-color: var(--green); }
+.evo-row.rel-removed { border-left-color: var(--red); }
+.evo-row.rel-continued { border-left-color: var(--muted); }
+.evo-row.rel-split { border-left-color: var(--amber); }
+.evo-row.rel-merge { border-left-color: #c084fc; }
+.evo-row.rel-split_merge { border-left-color: var(--amber); }
+.evo-row.is-ack-change { box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.45); }
+.evo-tags { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.rel-badge {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 700; border: 1px solid var(--border);
+}
+.rel-added { color: var(--green); border-color: rgba(52,211,153,0.45); background: var(--green-bg); }
+.rel-removed { color: var(--red); border-color: rgba(248,113,113,0.45); background: var(--red-bg); }
+.rel-continued { color: var(--muted); border-color: var(--border); }
+.rel-split { color: var(--amber); border-color: rgba(251,191,36,0.45); background: rgba(251,191,36,0.1); }
+.rel-merge { color: #c084fc; border-color: rgba(192,132,252,0.45); background: rgba(192,132,252,0.1); }
+.rel-ack { color: #60a5fa; border-color: rgba(96,165,250,0.45); background: rgba(96,165,250,0.1); }
+
+.evo-sides {
+  display: grid; grid-template-columns: 1fr 64px 1fr; gap: 10px; align-items: start;
+}
+@media (max-width: 900px) { .evo-sides { grid-template-columns: 1fr; } .evo-arrow { display: none; } }
+.evo-side {
+  border: 1px dashed var(--border); border-radius: 8px; padding: 8px 10px;
+  background: var(--bg); min-height: 56px;
+}
+.side-old { border-left: 3px solid var(--red); }
+.side-new { border-left: 3px solid var(--green); }
+.side-label { font-size: 11.5px; color: var(--muted); margin-bottom: 4px; }
+.ev-head-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0; }
+.ev-head-title { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ev-head-meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.evo-arrow { display: flex; align-items: center; justify-content: center; padding-top: 18px; }
+.arrow-count {
+  display: inline-block; padding: 4px 10px; border-radius: 999px;
+  background: var(--panel); border: 1px solid var(--accent);
+  color: var(--accent); font-weight: 700; font-size: 12.5px;
+}
+.evo-members { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+.mem-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
+.mem-label { color: var(--muted); flex: 0 0 150px; }
+.mem-chips { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.seq-chip.chip-common { color: var(--accent); border-color: rgba(56,189,248,0.5); }
+.seq-chip.chip-old { color: var(--red); border-color: rgba(248,113,113,0.45); }
+.seq-chip.chip-new { color: var(--green); border-color: rgba(52,211,153,0.45); }
