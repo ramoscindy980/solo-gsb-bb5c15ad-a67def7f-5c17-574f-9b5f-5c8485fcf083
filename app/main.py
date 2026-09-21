@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .correlation import (
     DEFAULT_GAP_SECONDS,
+    compare_snapshot_items,
     correlate_events,
     event_signature,
     normalize_gap,
@@ -783,6 +784,169 @@ def recompute_events():
     try:
         gap = _get_gap(conn)
         return _reconcile_events(conn, gap)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 事件演进：不可变快照与血缘对比（只读写 event_snapshots* 表，不回写 events）
+# ---------------------------------------------------------------------------
+
+def _snapshot_item_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "event_id": row["event_id"],
+        "device_id": row["device_id"],
+        "alert_type": row["alert_type"],
+        "first_ts": row["first_ts"],
+        "last_ts": row["last_ts"],
+        "alert_count": row["alert_count"],
+        "max_level": row["max_level"],
+        "member_ids": json.loads(row["member_ids"]),
+        "member_seqs": json.loads(row["member_seqs"]),
+        "acknowledged": bool(row["acknowledged"]),
+        "acked_at": row["acked_at"],
+    }
+
+
+def _snapshot_dict(conn, row, with_items: bool = False) -> dict:
+    out = {
+        "id": row["id"],
+        "note": row["note"] or "",
+        "gap_seconds": row["gap_seconds"],
+        "event_count": row["event_count"],
+        "created_at": row["created_at"],
+        "acknowledged_count": conn.execute(
+            "SELECT COUNT(*) FROM event_snapshot_items "
+            "WHERE snapshot_id=? AND acknowledged=1",
+            (row["id"],),
+        ).fetchone()[0],
+    }
+    if with_items:
+        rows = conn.execute(
+            "SELECT * FROM event_snapshot_items WHERE snapshot_id=? ORDER BY ord, id",
+            (row["id"],),
+        ).fetchall()
+        out["items"] = [_snapshot_item_dict(r) for r in rows]
+    return out
+
+
+@app.post("/api/event-snapshots")
+def create_event_snapshot(payload: dict = Body(default={})):
+    """把当前事件关联结果保存为不可变快照。
+
+    快照整体复制 events 表当前内容（聚合间隔、成员告警序号、确认状态、生成
+    时间）；之后的告警撤销、间隔调整与事件重算都不会改写已保存的快照。
+    """
+    note = str((payload or {}).get("note", "")).strip()[:200]
+    conn = db.get_conn()
+    try:
+        gap = _get_gap(conn)
+        _reconcile_events(conn, gap)  # 先把 events 表对齐到当前告警集合，再整体复制
+        rows = conn.execute(
+            "SELECT * FROM events ORDER BY first_ts, device_id, alert_type, id"
+        ).fetchall()
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                "INSERT INTO event_snapshots(note, gap_seconds, event_count) "
+                "VALUES (?, ?, ?)",
+                (note, gap, len(rows)),
+            )
+            snapshot_id = cur.lastrowid
+            for ord_, r in enumerate(rows):
+                conn.execute(
+                    """INSERT INTO event_snapshot_items(
+                       snapshot_id, ord, event_id, device_id, alert_type,
+                       first_ts, last_ts, alert_count, max_level,
+                       member_ids, member_seqs, acknowledged, acked_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (snapshot_id, ord_, r["id"], r["device_id"], r["alert_type"],
+                     r["first_ts"], r["last_ts"], r["alert_count"], r["max_level"],
+                     r["member_ids"], r["member_seqs"], r["acknowledged"],
+                     r["acked_at"]),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+        return _snapshot_dict(conn, row, with_items=True)
+    finally:
+        conn.close()
+
+
+@app.get("/api/event-snapshots")
+def list_event_snapshots():
+    """全部快照（按创建顺序），不含事件明细。"""
+    conn = db.get_conn()
+    try:
+        rows = conn.execute("SELECT * FROM event_snapshots ORDER BY id").fetchall()
+        return [_snapshot_dict(conn, r) for r in rows]
+    finally:
+        conn.close()
+
+
+# 注意：/compare 必须注册在 /{snapshot_id} 之前，否则会被路径参数路由截获
+@app.get("/api/event-snapshots/compare")
+def compare_event_snapshots(from_id: int, to_id: int):
+    """对比两个快照：按成员交集建立确定性血缘（新增/消失/拆分/合并/延续/确认变化）。"""
+    conn = db.get_conn()
+    try:
+        old = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (from_id,)
+        ).fetchone()
+        new = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (to_id,)
+        ).fetchone()
+        if not old:
+            raise HTTPException(404, f"快照 {from_id} 不存在")
+        if not new:
+            raise HTTPException(404, f"快照 {to_id} 不存在")
+
+        def load_items(snapshot_id: int) -> list[dict]:
+            rows = conn.execute(
+                "SELECT * FROM event_snapshot_items WHERE snapshot_id=? "
+                "ORDER BY ord, id",
+                (snapshot_id,),
+            ).fetchall()
+            return [_snapshot_item_dict(r) for r in rows]
+
+        relations = compare_snapshot_items(load_items(from_id), load_items(to_id))
+        summary = {
+            "relations": len(relations),
+            "added": sum(1 for r in relations if r["kind"] == "added"),
+            "removed": sum(1 for r in relations if r["kind"] == "removed"),
+            "continued": sum(1 for r in relations if r["kind"] == "continued"),
+            "ack_changed": sum(1 for r in relations if r["kind"] == "ack_changed"),
+            "split": sum(1 for r in relations if r["split"]),
+            "merge": sum(1 for r in relations if r["merge"]),
+            "changed": sum(1 for r in relations if r["changed"]),
+            "unchanged": sum(1 for r in relations if not r["changed"]),
+        }
+        return {
+            "from": _snapshot_dict(conn, old),
+            "to": _snapshot_dict(conn, new),
+            "relations": relations,
+            "summary": summary,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/event-snapshots/{snapshot_id}")
+def get_event_snapshot(snapshot_id: int):
+    """单个快照的完整内容（含每个事件的成员序号与确认状态）。"""
+    conn = db.get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM event_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "快照不存在")
+        return _snapshot_dict(conn, row, with_items=True)
     finally:
         conn.close()
 

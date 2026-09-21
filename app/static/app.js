@@ -20,6 +20,8 @@ let state = {
   settings: {},
   compare: { a: null, b: null, result: null },
   events: { events: [], devices: [], gap_seconds: 900 },
+  snapshots: [],
+  snapCompare: { from: null, to: null, result: null },
 };
 
 function eventFilters() {
@@ -73,6 +75,7 @@ async function refreshAll() {
   renderSettings();
   if (state.compare.a && state.compare.b) await loadCompare();
   await loadEvents();
+  await loadSnapshots();
 }
 
 async function loadStaged() {
@@ -350,6 +353,161 @@ async function toggleEventAck(id, ack) {
     });
     await loadEvents();
   } catch (e) { fail(e); }
+}
+
+// ---------------------------------------------------------------------------
+// Tab 2.5: 事件演进（快照 + 血缘对比）
+// ---------------------------------------------------------------------------
+
+const KIND_LABEL = {
+  added: "新增",
+  removed: "消失",
+  continued: "延续",
+  ack_changed: "确认变化",
+  split: "拆分",
+  merge: "合并",
+  split_merge: "拆分+合并",
+};
+
+async function loadSnapshots() {
+  state.snapshots = await api("/api/event-snapshots");
+  renderSnapshots();
+  renderSnapSelects();
+}
+
+function snapLabel(s) {
+  const note = s.note ? ` · ${s.note}` : "";
+  return `#${s.id} ${s.created_at} · ${s.event_count} 事件 · ${s.acknowledged_count} 已确认 · 间隔 ${s.gap_seconds}s${note}`;
+}
+
+function renderSnapshots() {
+  $("#snap-total").textContent = `${state.snapshots.length} 个快照`;
+  const box = $("#snapshot-list");
+  if (!state.snapshots.length) {
+    box.innerHTML = '<p class="empty">暂无快照。先注入告警生成事件，再点击上方按钮保存第一份快照。</p>';
+    return;
+  }
+  box.innerHTML = state.snapshots.map((s) => `
+    <div class="snapshot-item">
+      <span><b>#${s.id}</b> ${esc(s.note || "(无说明)")}</span>
+      <span style="color:var(--muted)">${esc(s.created_at)} · ${s.event_count} 事件 ·
+        ${s.acknowledged_count} 已确认 · 间隔 ${s.gap_seconds}s</span>
+    </div>`).join("");
+}
+
+function renderSnapSelects() {
+  const from = $("#snap-from"), to = $("#snap-to");
+  const opts = state.snapshots.map((s) =>
+    `<option value="${s.id}">${esc(snapLabel(s))}</option>`).join("");
+  from.innerHTML = opts;
+  to.innerHTML = opts;
+  const ids = state.snapshots.map((s) => s.id);
+  // 默认对比最近两份快照；保留用户已选（若仍存在）
+  if (!state.snapCompare.from || !ids.includes(state.snapCompare.from)) {
+    state.snapCompare.from = ids.length >= 2 ? ids[ids.length - 2] : (ids[0] || null);
+  }
+  if (!state.snapCompare.to || !ids.includes(state.snapCompare.to)) {
+    state.snapCompare.to = ids.length ? ids[ids.length - 1] : null;
+  }
+  if (state.snapCompare.from) from.value = state.snapCompare.from;
+  if (state.snapCompare.to) to.value = state.snapCompare.to;
+}
+
+async function createSnapshot() {
+  try {
+    const s = await api("/api/event-snapshots", {
+      method: "POST",
+      body: JSON.stringify({ note: $("#snap-note").value.trim() }),
+    });
+    $("#snap-note").value = "";
+    await loadSnapshots();
+    toast(`快照 #${s.id} 已保存：${s.event_count} 个事件（间隔 ${s.gap_seconds}s），此后不再被改写`);
+  } catch (e) { fail(e); }
+}
+
+async function compareSnapshots() {
+  const from = Number($("#snap-from").value);
+  const to = Number($("#snap-to").value);
+  if (!from || !to) return toast("需要至少保存两份快照才能对比", true);
+  state.snapCompare.from = from;
+  state.snapCompare.to = to;
+  try {
+    state.snapCompare.result =
+      await api(`/api/event-snapshots/compare?from_id=${from}&to_id=${to}`);
+    renderSnapCompare();
+  } catch (e) { fail(e); }
+}
+
+function snapEventHtml(ev) {
+  const seqs = ev.member_seqs.map((s) => `<span class="seq-chip">#${s}</span>`).join(" ");
+  const ack = ev.acknowledged
+    ? '<span class="badge pass">✓ 已确认</span>'
+    : '<span class="badge suppress">● 未确认</span>';
+  return `<div class="rel-ev">
+    <div class="rel-ev-head">
+      <b>${esc(ev.device_id || "(空设备)")}</b>
+      <span class="badge">${esc(ev.alert_type || "(无类型)")}</span>
+      ${levelBadge(ev.max_level)} ${ack}
+      <span class="hint" style="margin:0">事件ID ${ev.event_id}</span>
+    </div>
+    <div class="ev-meta">
+      <span>首条 <b>${esc(ev.first_ts)}</b></span>
+      <span>末条 <b>${esc(ev.last_ts)}</b></span>
+      <span>告警数 <b>${ev.alert_count}</b></span>
+    </div>
+    <div class="ev-seqs">成员序号：${seqs}</div>
+  </div>`;
+}
+
+function relationHtml(rel) {
+  const badges = [`<span class="rel-kind kind-${rel.kind}">${KIND_LABEL[rel.kind]}</span>`];
+  if (!rel.changed) badges.push('<span class="badge">未变化</span>');
+
+  let inter;
+  if (rel.old.length === 1 && rel.new.length === 1) {
+    inter = `两侧交集 <b>${rel.intersection_count}</b> 条成员`;
+  } else if (rel.intersections.length) {
+    inter = `总交集 <b>${rel.intersection_count}</b> 条成员（逐对：` +
+      rel.intersections.map((x) =>
+        `旧E${x.old_event_id}∩新E${x.new_event_id}=${x.count}`).join("，") + "）";
+  } else {
+    inter = "两侧无交集成员";
+  }
+
+  const oldSide = rel.old.map(snapEventHtml).join("") ||
+    '<p class="empty" style="padding:10px">（旧快照中无对应事件）</p>';
+  const newSide = rel.new.map(snapEventHtml).join("") ||
+    '<p class="empty" style="padding:10px">（新快照中无对应事件）</p>';
+  return `<div class="relation-card${rel.changed ? "" : " unchanged"}">
+    <div class="rel-head">${badges.join("")}<span class="rel-inter">${inter}</span></div>
+    <div class="rel-sides">
+      <div class="rel-side">
+        <div class="rel-side-title">旧快照侧（${rel.old.length} 个事件）</div>${oldSide}
+      </div>
+      <div class="rel-arrow">→</div>
+      <div class="rel-side">
+        <div class="rel-side-title">新快照侧（${rel.new.length} 个事件）</div>${newSide}
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderSnapCompare() {
+  const r = state.snapCompare.result;
+  if (!r) return;
+  const s = r.summary;
+  $("#snap-summary").innerHTML =
+    `对比 <b>#${r.from.id}${r.from.note ? ` ${esc(r.from.note)}` : ""}</b>（${esc(r.from.created_at)}）→
+     <b>#${r.to.id}${r.to.note ? ` ${esc(r.to.note)}` : ""}</b>（${esc(r.to.created_at)}）：
+     共 ${s.relations} 组血缘关系 — 新增 ${s.added} · 消失 ${s.removed} ·
+     拆分 ${s.split} · 合并 ${s.merge} · 延续 ${s.continued} ·
+     确认变化 ${s.ack_changed} · 未变化 ${s.unchanged}`;
+
+  const onlyChanged = $("#snap-only-changed").checked;
+  const rels = r.relations.filter((rel) => !onlyChanged || rel.changed);
+  $("#snap-relations").innerHTML = rels.length
+    ? rels.map(relationHtml).join("")
+    : `<p class="empty">${onlyChanged ? "两个快照之间没有任何变化" : "两个快照都没有事件"}</p>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +822,7 @@ function bind() {
     $(`#tab-${btn.dataset.tab}`).classList.add("active");
     if (btn.dataset.tab === "receiver") loadReceiverLogs();
     if (btn.dataset.tab === "events") loadEvents().catch(fail);
+    if (btn.dataset.tab === "evolution") loadSnapshots().catch(fail);
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -671,6 +830,9 @@ function bind() {
   $("#btn-undo").addEventListener("click", doUndo);
   $("#btn-save-gap").addEventListener("click", saveGap);
   $("#btn-recompute").addEventListener("click", recomputeEvents);
+  $("#btn-snapshot").addEventListener("click", createSnapshot);
+  $("#btn-compare-snap").addEventListener("click", compareSnapshots);
+  $("#snap-only-changed").addEventListener("change", renderSnapCompare);
   $("#btn-clear-filters").addEventListener("click", async () => {
     for (const id of ["#ev-filter-device", "#ev-filter-level", "#ev-filter-status",
                       "#ev-filter-start", "#ev-filter-end"]) {

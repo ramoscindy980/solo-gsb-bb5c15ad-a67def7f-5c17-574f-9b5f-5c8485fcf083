@@ -104,6 +104,34 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_times ON events(first_ts, last_ts);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, alert_type);
+
+-- 事件演进：不可变快照。保存后不再被任何操作改写（撤销告警、调整间隔、
+-- 重算事件都只影响 events 表）；仅 /api/reset 恢复出厂时随业务数据一并清空。
+CREATE TABLE IF NOT EXISTS event_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note TEXT DEFAULT '',
+    gap_seconds INTEGER NOT NULL DEFAULT 900,   -- 生成快照时的聚合间隔
+    event_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS event_snapshot_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL REFERENCES event_snapshots(id) ON DELETE CASCADE,
+    ord INTEGER NOT NULL,                    -- 快照内稳定顺序（首时间, 设备, 类型, 事件 id）
+    event_id INTEGER,                        -- 生成快照时的 events.id（血缘排序用）
+    device_id TEXT NOT NULL DEFAULT '',
+    alert_type TEXT NOT NULL DEFAULT '',
+    first_ts TEXT NOT NULL,
+    last_ts TEXT NOT NULL,
+    alert_count INTEGER NOT NULL,
+    max_level TEXT NOT NULL DEFAULT 'info',
+    member_ids TEXT NOT NULL,                -- JSON: 按时间线排序的 alerts.id
+    member_seqs TEXT NOT NULL,               -- JSON: 对应的注入序号
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    acked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snapshot_items ON event_snapshot_items(snapshot_id, ord);
 """
 
 _RULE_COLS = [
@@ -218,7 +246,8 @@ def reset_all(conn) -> None:
     try:
         conn.executescript(
             "DELETE FROM decisions; DELETE FROM receiver_logs; DELETE FROM staged; "
-            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events;"
+            "DELETE FROM alerts; DELETE FROM rules; DELETE FROM runs; DELETE FROM events; "
+            "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
         )
         inserted_ids = []
         for rule in seed_rules():
@@ -269,7 +298,8 @@ def init_db(force_seed: bool = False) -> None:
                     conn.executescript(
                         "DELETE FROM decisions; DELETE FROM receiver_logs; "
                         "DELETE FROM staged; DELETE FROM alerts; DELETE FROM rules; "
-                        "DELETE FROM runs; DELETE FROM events;"
+                        "DELETE FROM runs; DELETE FROM events; "
+                        "DELETE FROM event_snapshot_items; DELETE FROM event_snapshots;"
                     )
                 for rule in seed_rules():
                     conn.execute(

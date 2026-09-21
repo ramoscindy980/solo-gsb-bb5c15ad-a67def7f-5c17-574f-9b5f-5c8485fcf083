@@ -228,3 +228,41 @@ tr:hover td { background: rgba(56, 189, 248, 0.04); }
 .tl-ts { color: var(--muted); font-family: "SF Mono", Consolas, monospace; font-size: 11.5px; }
 .tl-msg { color: var(--text); flex: 1; min-width: 180px; }
 .decision.small { font-size: 11px; padding: 1px 7px; }
+
+/* ---------------- 事件演进（快照与血缘对比） ---------------- */
+.snapshot-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.snapshot-item {
+  display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; background: var(--panel-2); font-size: 12.5px;
+}
+
+.relation-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.relation-card {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel-2); padding: 12px 14px;
+  border-left: 3px solid var(--accent);
+}
+.relation-card.unchanged { opacity: 0.78; border-left-color: var(--border); }
+.rel-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.rel-kind { font-weight: 700; padding: 2px 10px; border-radius: 6px; font-size: 12px; white-space: nowrap; }
+.kind-added { background: var(--green-bg); color: var(--green); }
+.kind-removed { background: var(--red-bg); color: var(--red); }
+.kind-split, .kind-split_merge { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+.kind-merge { background: rgba(56, 189, 248, 0.15); color: var(--accent); }
+.kind-continued { background: rgba(142, 162, 184, 0.18); color: var(--muted); }
+.kind-ack_changed { background: rgba(192, 132, 252, 0.15); color: #c084fc; }
+.rel-inter { color: var(--muted); font-size: 12.5px; }
+.rel-inter b { color: var(--text); }
+.rel-sides { display: grid; grid-template-columns: 1fr auto 1fr; gap: 10px; align-items: start; }
+.rel-arrow { color: var(--muted); font-size: 18px; padding-top: 30px; }
+.rel-side-title { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.rel-ev {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; background: var(--panel); margin-bottom: 6px;
+}
+.rel-ev-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+@media (max-width: 900px) {
+  .rel-sides { grid-template-columns: 1fr; }
+  .rel-arrow { display: none; }
+}

@@ -18,6 +18,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="inject">告警注入</button>
     <button class="tab" data-tab="events">事件关联</button>
+    <button class="tab" data-tab="evolution">事件演进</button>
     <button class="tab" data-tab="rules">抑制规则</button>
     <button class="tab" data-tab="compare">策略对比</button>
     <button class="tab" data-tab="receiver">模拟接收端</button>
@@ -119,6 +120,39 @@
       </div>
       <p class="hint">时间筛选取<strong>时间区间有重叠</strong>的事件；每个事件可展开查看成员序号与完整时间线（含 live 链决定）。</p>
       <div id="events-list" class="event-list"></div>
+    </div>
+  </section>
+
+  <!-- ===================== 事件演进 ===================== -->
+  <section id="tab-evolution" class="panel">
+    <div class="card">
+      <h2>事件快照 <span class="badge" id="snap-total">0</span></h2>
+      <p class="hint">把<strong>当前</strong>事件关联结果保存为<strong>不可变快照</strong>：记录聚合间隔、每个事件的成员告警序号、确认状态与生成时间。
+        保存后撤销告警、调整聚合间隔或重算事件都<strong>不会改写</strong>历史快照（仅「恢复出厂」会随全部业务数据一并清空）。</p>
+      <div class="toolbar">
+        <input id="snap-note" placeholder="快照说明（可选），如：调整间隔前">
+        <button class="btn primary" id="btn-snapshot">📸 保存当前事件为快照</button>
+      </div>
+      <div id="snapshot-list" class="snapshot-list"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>快照对比（事件血缘）</h2>
+      <p class="hint">任选两个快照，按<strong>成员交集</strong>建立确定性血缘：无交集的新/旧事件分别标记「新增 / 消失」；旧事件重叠多个新事件标记「拆分」，
+        新事件重叠多个旧事件标记「合并」（两者可同时出现）；其余有交集的标记「延续」；成员完全相同但确认状态变化的单独标记「确认变化」。
+        结果按新事件首时间、旧事件 ID 稳定排序，与对比发起时机无关。</p>
+      <div class="toolbar" style="align-items:flex-end">
+        <label style="margin:0;flex:1;min-width:220px">旧快照（from）
+          <select id="snap-from"></select>
+        </label>
+        <label style="margin:0;flex:1;min-width:220px">新快照（to）
+          <select id="snap-to"></select>
+        </label>
+        <button class="btn primary" id="btn-compare-snap">⇄ 对比</button>
+        <label class="checkbox" style="margin:0 0 4px"><input type="checkbox" id="snap-only-changed"> 仅看变化</label>
+      </div>
+      <div id="snap-summary" class="summary"></div>
+      <div id="snap-relations" class="relation-list"></div>
     </div>
   </section>
 
